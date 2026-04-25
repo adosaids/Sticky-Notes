@@ -27,13 +27,14 @@ if sys.platform == "win32":
 
 from PyQt6.QtCore import Qt, QEvent, QStandardPaths, pyqtSignal
 from PyQt6.QtGui import (
-    QPainter, QPainterPath, QColor, QPen, QFont, QIcon, QPixmap, QAction, QRegion
+    QPainter, QPainterPath, QColor, QPen, QFont, QIcon, QPixmap, QAction, QRegion,
 )
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QScrollArea,
     QCheckBox, QSystemTrayIcon, QMenu, QFrame,
-    QWIDGETSIZE_MAX
+    QWIDGETSIZE_MAX, QTextEdit, QMessageBox,
+    QGraphicsDropShadowEffect,
 )
 
 
@@ -198,12 +199,157 @@ class RoundCheckBox(QWidget):
             painter.drawEllipse(r)
 
 
+class TaskDetailPopup(QWidget):
+    """双击任务条后弹出的详情悬浮窗：圆角 + 阴影 + 自动换行完整文本 + 删除按钮"""
+
+    delete_requested = pyqtSignal(int)
+
+    def __init__(self, task_text: str, task_id: int, on_delete, parent=None):
+        super().__init__(parent)
+        self.task_text = task_text
+        self.task_id = task_id
+        self.on_delete = on_delete
+        self._setup_ui()
+
+    def _setup_ui(self):
+        self.setWindowFlags(
+            Qt.WindowType.Popup
+            | Qt.WindowType.FramelessWindowHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # 内部容器（圆角背景 + 白色填充）
+        container = QWidget()
+        container.setObjectName("detailContainer")
+        container.setStyleSheet(
+            "QWidget#detailContainer {"
+            f"  background: {BG_COLOR}; border-radius: {CORNER_RADIUS}px;"
+            "}"
+        )
+        inner = QVBoxLayout(container)
+        inner.setContentsMargins(14, 10, 14, 10)
+        inner.setSpacing(8)
+
+        # 顶部栏：标题 + 关闭按钮
+        top_bar = QHBoxLayout()
+        top_bar.setContentsMargins(0, 0, 0, 0)
+        title = QLabel("任务详情")
+        title.setFont(QFont("Microsoft YaHei UI", 12, QFont.Weight.Bold))
+        title.setStyleSheet("color: #333;")
+        top_bar.addWidget(title, stretch=1)
+
+        btn_close = QPushButton("×")
+        btn_close.setFixedSize(22, 22)
+        btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_close.setObjectName("detailCloseBtn")
+        btn_close.setStyleSheet(
+            "QPushButton#detailCloseBtn {"
+            "  background: transparent; border: none; color: #999;"
+            "  font-size: 18px; font-weight: bold; border-radius: 11px;"
+            "}"
+            "QPushButton#detailCloseBtn:hover {"
+            "  background: rgba(0,0,0,0.08); color: #333;"
+            "}"
+        )
+        btn_close.clicked.connect(self.close)
+        top_bar.addWidget(btn_close)
+        inner.addLayout(top_bar)
+
+        # 内容区：只读 QTextEdit（自动换行）
+        self.text_edit = QTextEdit()
+        self.text_edit.setReadOnly(True)
+        self.text_edit.setPlainText(self.task_text)
+        self.text_edit.setFont(QFont("Microsoft YaHei UI", 12))
+        self.text_edit.setStyleSheet(
+            "QTextEdit {"
+            "  background: #fff; border: 1px solid #e0ddd0;"
+            "  border-radius: 8px; padding: 8px 10px; color: #333;"
+            "}"
+        )
+        self.text_edit.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.text_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.text_edit.setMinimumHeight(100)
+        inner.addWidget(self.text_edit)
+
+        # 底部：删除按钮
+        btn_bar = QHBoxLayout()
+        btn_bar.setContentsMargins(0, 4, 0, 0)
+        btn_bar.addStretch()
+
+        btn_del = QPushButton("删除任务")
+        btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_del.setObjectName("detailDelBtn")
+        btn_del.setStyleSheet(
+            "QPushButton#detailDelBtn {"
+            "  background: transparent; border: 1px solid #FF4444;"
+            "  color: #FF4444; border-radius: 6px;"
+            "  font-size: 12px; padding: 4px 14px;"
+            "}"
+            "QPushButton#detailDelBtn:hover {"
+            "  background: #FF4444; color: #fff;"
+            "}"
+        )
+        btn_del.clicked.connect(self._on_delete)
+        btn_bar.addWidget(btn_del)
+        inner.addLayout(btn_bar)
+
+        layout.addWidget(container)
+
+        # 阴影
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(16)
+        shadow.setOffset(0, 3)
+        shadow.setColor(QColor(0, 0, 0, 50))
+        container.setGraphicsEffect(shadow)
+
+        # 固定宽度，高度根据内容自适应
+        self.setFixedWidth(300)
+
+    def _on_delete(self):
+        reply = QMessageBox.question(
+            self, "确认删除",
+            f"确定要删除这条任务吗？\n{self.task_text[:60]}{'...' if len(self.task_text) > 60 else ''}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.delete_requested.emit(self.task_id)
+            self.close()
+
+    def show_at(self, parent_widget):
+        """定位到父组件右侧弹出，超出屏幕则换到左侧"""
+        geo = parent_widget.geometry()
+        screen = QApplication.primaryScreen().geometry()
+        popup_w = self.width()
+        super().show()
+        # 用 QTextEdit.document().size() 估算内容高度
+        doc_h = self.text_edit.document().size().height()
+        # 加上顶部标题栏、边距、底部按钮的大致高度
+        estimated_h = max(200, min(450, int(doc_h + 90)))
+        self.setFixedHeight(estimated_h)
+
+        popup_h = self.height()
+        x = geo.right() + 6
+        y = geo.top()
+        # 右侧不够 → 左侧
+        if x + popup_w > screen.right():
+            x = geo.left() - popup_w - 6
+        x = max(screen.left() + 10, min(x, screen.right() - popup_w - 10))
+        y = max(screen.top() + 10, min(y, screen.bottom() - popup_h - 10))
+        self.move(x, y)
+
+
 class TaskItemWidget(QWidget):
     """单条任务项：复选框 + 文本 + 删除按钮"""
 
-    def __init__(self, task, on_toggle, on_delete, parent=None):
+    def __init__(self, task, on_toggle, on_delete, show_detail=None, parent=None):
         super().__init__(parent)
         self.task = task
+        self._full_text = task["text"]
+        self._show_detail = show_detail
         self.setFixedHeight(40)
         self._setup_ui(on_toggle, on_delete)
         self._apply_style()
@@ -221,6 +367,7 @@ class TaskItemWidget(QWidget):
         self.label.setFont(QFont("Microsoft YaHei UI", 12))
         self.label.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         self.label.setWordWrap(False)
+        self.label.setMinimumWidth(40)
         self._update_text_style()
         layout.addWidget(self.label, stretch=1)
 
@@ -257,6 +404,15 @@ class TaskItemWidget(QWidget):
     def leaveEvent(self, event):
         self.btn_del.setVisible(False)
         super().leaveEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._show_detail:
+            # 点击 checkbox 区域不触发详情
+            cb_rect = self.cb.geometry()
+            if not cb_rect.contains(event.position().toPoint()):
+                self._show_detail(self.task["id"])
+                return
+        super().mouseDoubleClickEvent(event)
 
 
 # ──────────────────────────────────────────────
@@ -740,12 +896,30 @@ class StickyNotes(QWidget):
             task,
             on_toggle=self.toggle_task,
             on_delete=self.delete_task,
+            show_detail=self._show_task_detail,
             parent=self,
         )
         w.setStyleSheet(
             f"TaskItemWidget {{ border-bottom: 1px solid {DIVIDER}; }}"
         )
         return w
+
+    def _show_task_detail(self, task_id: int):
+        """双击任务条时弹出详情悬浮窗"""
+        task = next((t for t in self.tasks if t["id"] == task_id), None)
+        if not task:
+            return
+        # 关闭已存在的弹窗
+        if hasattr(self, "_detail_popup") and self._detail_popup.isVisible():
+            self._detail_popup.close()
+        popup = TaskDetailPopup(task["text"], task_id, self.delete_task, self)
+        popup.delete_requested.connect(self.delete_task)
+        self._detail_popup = popup
+        # 找到对应的 TaskItemWidget
+        for w in self._task_widgets:
+            if w.task["id"] == task_id:
+                popup.show_at(w)
+                break
 
     def eventFilter(self, obj, event):
         if obj == self.scroll_area and event.type() == QEvent.Type.Paint:
