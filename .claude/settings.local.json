@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python *)",
+      "Bash(pip install *)",
+      "Bash(tasklist)",
+      "Bash(QT_DEBUG_PLUGINS=1 python \"E:\\\\bianqian\\\\main.py\")",
+      "Bash(F:/huanjing/envs/knowself/python.exe *)",
+      "Bash(export PATH=\"F:/huanjing/envs/knowself/Lib/site-packages/PyQt6/Qt6/bin:$PATH\")",
+      "Bash(\"F:/huanjing/envs/knowself/python.exe\" -c \"from PyQt6.QtWidgets import QApplication; print\\('PyQt6 OK'\\)\")",
+      "Bash(git init *)",
+      "Bash(git add *)",
+      "Bash(git commit *)"
+    ]
+  }
+}

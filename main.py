@@ -25,9 +25,9 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-from PyQt6.QtCore import Qt, QEvent, QStandardPaths
+from PyQt6.QtCore import Qt, QEvent, QStandardPaths, pyqtSignal
 from PyQt6.QtGui import (
-    QPainter, QPainterPath, QColor, QPen, QFont, QIcon, QPixmap, QAction
+    QPainter, QPainterPath, QColor, QPen, QFont, QIcon, QPixmap, QAction, QRegion
 )
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -77,7 +77,7 @@ class DataManager:
             "version": "1.0",
             "window": {
                 "x": None, "y": None,
-                "width": 320, "height": 400,
+                "width": DEFAULT_W, "height": DEFAULT_H,
                 "collapsed": False,
             },
             "tasks": [],
@@ -93,8 +93,8 @@ class DataManager:
             data.setdefault("window", default["window"])
             data["window"].setdefault("x", None)
             data["window"].setdefault("y", None)
-            data["window"].setdefault("width", 320)
-            data["window"].setdefault("height", 400)
+            data["window"].setdefault("width", DEFAULT_W)
+            data["window"].setdefault("height", DEFAULT_H)
             data["window"].setdefault("collapsed", False)
             if not isinstance(data["tasks"], list):
                 data["tasks"] = []
@@ -141,6 +141,63 @@ class DataManager:
 # 任务项组件
 # ──────────────────────────────────────────────
 
+class RoundCheckBox(QWidget):
+    """自定义圆形复选框：手绘圆形，确保各平台都显示为完美圆形"""
+    toggled = pyqtSignal(bool)
+
+    def __init__(self, checked=False, parent=None):
+        super().__init__(parent)
+        self._checked = checked
+        self._hover = False
+        self.setFixedSize(18, 18)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def isChecked(self):
+        return self._checked
+
+    def setChecked(self, state):
+        self._checked = state
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._checked = not self._checked
+            self.update()
+            self.toggled.emit(self._checked)
+        super().mousePressEvent(event)
+
+    def enterEvent(self, event):
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = self.rect().adjusted(1, 1, -1, -1)
+
+        if self._checked:
+            painter.setBrush(QColor("#52c41a"))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(r)
+            pen = QPen(QColor("#fff"), 2)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            cx, cy = r.center().x(), r.center().y()
+            painter.drawLine(int(cx - 3), int(cy), int(cx - 1), int(cy + 2))
+            painter.drawLine(int(cx - 1), int(cy + 2), int(cx + 4), int(cy - 2))
+        else:
+            painter.setPen(QPen(QColor("#52c41a" if self._hover else "#d9d9d9"), 2))
+            painter.setBrush(QColor("#fff"))
+            painter.drawEllipse(r)
+
+
 class TaskItemWidget(QWidget):
     """单条任务项：复选框 + 文本 + 删除按钮"""
 
@@ -156,10 +213,8 @@ class TaskItemWidget(QWidget):
         layout.setContentsMargins(12, 4, 12, 4)
         layout.setSpacing(8)
 
-        self.cb = QCheckBox()
-        self.cb.setFixedSize(18, 18)
-        self.cb.setChecked(self.task["completed"])
-        self.cb.clicked.connect(lambda: on_toggle(self.task["id"]))
+        self.cb = RoundCheckBox(checked=self.task["completed"])
+        self.cb.toggled.connect(lambda: on_toggle(self.task["id"]))
         layout.addWidget(self.cb)
 
         self.label = QLabel(self.task["text"])
@@ -178,16 +233,6 @@ class TaskItemWidget(QWidget):
         layout.addWidget(self.btn_del)
 
     def _apply_style(self):
-        self.cb.setStyleSheet(
-            "QCheckBox::indicator {"
-            "    width: 18px; height: 18px; border-radius: 9px;"
-            "    border: 2px solid #d9d9d9; background: #fff;"
-            "}"
-            "QCheckBox::indicator:checked {"
-            "    background-color: #52c41a; border-color: #52c41a;"
-            "}"
-            "QCheckBox::indicator:hover { border-color: #52c41a; }"
-        )
         self.btn_del.setStyleSheet(
             "QPushButton#delBtn {"
             "    background: transparent; border: none;"
@@ -222,10 +267,10 @@ BG_COLOR = "#FFFEF0"
 TITLE_BG = "#FFF9DB"
 INPUT_BG = "#FFFEF0"
 DIVIDER = "#f0ece0"
-FOLD_HEIGHT = 45
-DEFAULT_W, DEFAULT_H = 320, 400
-CORNER_RADIUS = 12
-SHADOW_WIDTH = 16  # 阴影外扩宽度
+FOLD_HEIGHT = 32
+DEFAULT_W, DEFAULT_H = 260, 300
+CORNER_RADIUS = 10
+SHADOW_WIDTH = 4  # 阴影外扩宽度
 
 
 class StickyNotes(QWidget):
@@ -239,9 +284,8 @@ class StickyNotes(QWidget):
         self.is_collapsed = False
         self.drag_pos = None
         self.is_dragging = False
-        self._shadow = SHADOW_WIDTH
         self._task_widgets = []
-        self.empty_label = None  # 阴影宽度
+        self.empty_label = None
 
         self._init_window()
         self._load_and_restore()
@@ -252,17 +296,16 @@ class StickyNotes(QWidget):
     # ── 窗口初始化 ──
 
     def _init_window(self):
-        """无边框、置顶、不在任务栏显示"""
+        """无边框、置顶、不在任务栏显示，setMask 裁剪圆角"""
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
         )
-        # 使用 WA_TranslucentBackground 但不用 QGraphicsDropShadowEffect，
-        # 阴影在 paintEvent 中手绘，避免 Windows 下 UpdateLayeredWindowIndirect 报错
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setMinimumSize(280, FOLD_HEIGHT)
+        self.setMinimumSize(DEFAULT_W, FOLD_HEIGHT)
         self.resize(DEFAULT_W, DEFAULT_H)
+        self.setStyleSheet(f"background: {BG_COLOR};")
+        self._apply_mask()
 
     # ── 数据加载 ──
 
@@ -298,10 +341,9 @@ class StickyNotes(QWidget):
     # ── UI 构建 ──
 
     def _setup_ui(self):
-        """构建全部 UI 组件，内容区留阴影宽度的边距"""
-        s = self._shadow
+        """构建全部 UI 组件"""
         self.main_layout = QVBoxLayout(self)
-        self.main_layout.setContentsMargins(s, s, s, s)
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
         self.main_layout.setSpacing(0)
 
         # 标题栏
@@ -381,7 +423,7 @@ class StickyNotes(QWidget):
         layout.addWidget(self.counter_label, stretch=1)
 
         # 折叠按钮
-        self.btn_collapse = QPushButton("—")
+        self.btn_collapse = QPushButton("-")
         self.btn_collapse.setFixedSize(28, 28)
         self.btn_collapse.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_collapse.setToolTip("折叠/展开")
@@ -455,33 +497,21 @@ class StickyNotes(QWidget):
 
         return area
 
-    # ── 圆角背景 + 阴影绘制 ──
+    # ── 圆角裁剪 ──
 
-    def paintEvent(self, event):
-        """绘制圆角背景 + 手绘阴影，避免 QGraphicsDropShadowEffect 的兼容问题"""
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        s = self._shadow
+    def _apply_mask(self):
+        """用 setMask 裁剪窗口为圆角矩形"""
         r = CORNER_RADIUS
         w, h = self.width(), self.height()
-
-        # 1) 阴影（多层半透明圆角矩形模拟模糊效果）
-        shadow_color = QColor(0, 0, 0, 12)
-        for i in range(4):
-            offset = i + 1
-            rect = s - offset * 2
-            path = QPainterPath()
-            path.addRoundedRect(
-                rect, rect, w - 2 * rect, h - 2 * rect, r, r
-            )
-            painter.fillPath(path, shadow_color)
-
-        # 2) 主体圆角矩形背景
-        main_rect = s
         path = QPainterPath()
-        path.addRoundedRect(main_rect, main_rect, w - 2 * main_rect, h - 2 * main_rect, r, r)
-        painter.fillPath(path, QColor(BG_COLOR))
+        path.addRoundedRect(0, 0, w, h, r, r)
+        region = QRegion(path.toFillPolygon().toPolygon())
+        self.setMask(region)
+
+    def resizeEvent(self, event):
+        """窗口大小变化时重新应用圆角裁剪"""
+        super().resizeEvent(event)
+        self._apply_mask()
 
     # ── 托盘 ──
 
@@ -556,7 +586,7 @@ class StickyNotes(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            if event.position().y() < 40 + self._shadow:
+            if event.position().y() < 40:
                 self.drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
                 self.is_dragging = True
         super().mousePressEvent(event)
@@ -604,20 +634,20 @@ class StickyNotes(QWidget):
         """折叠为仅标题栏"""
         self.is_collapsed = True
         self.content_widget.hide()
-        self.setFixedHeight(FOLD_HEIGHT + self._shadow * 2)
-        self.setMinimumHeight(FOLD_HEIGHT + self._shadow * 2)
-        self.setMaximumHeight(FOLD_HEIGHT + self._shadow * 2)
+        self.setFixedHeight(FOLD_HEIGHT + SHADOW_WIDTH * 2)
+        self.setMinimumHeight(FOLD_HEIGHT + SHADOW_WIDTH * 2)
+        self.setMaximumHeight(FOLD_HEIGHT + SHADOW_WIDTH * 2)
         self.btn_collapse.setText("＋")
         self._save_current_state()
 
     def _do_expand(self):
         """展开恢复"""
         self.is_collapsed = False
-        self.setMinimumHeight(FOLD_HEIGHT + self._shadow * 2)
+        self.setMinimumHeight(FOLD_HEIGHT + SHADOW_WIDTH * 2)
         self.setMaximumHeight(QWIDGETSIZE_MAX)
         self.setFixedHeight(DEFAULT_H)
         self.content_widget.show()
-        self.btn_collapse.setText("—")
+        self.btn_collapse.setText("-")
         self._save_current_state()
 
     # ── 关闭事件 ──
@@ -629,7 +659,7 @@ class StickyNotes(QWidget):
     # ── 双击标题栏折叠 ──
 
     def mouseDoubleClickEvent(self, event):
-        if event.position().y() < 40 + self._shadow:
+        if event.position().y() < 40 + SHADOW_WIDTH:
             self.toggle_collapse()
         super().mouseDoubleClickEvent(event)
 
