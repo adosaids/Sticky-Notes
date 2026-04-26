@@ -26,6 +26,7 @@ if sys.platform == "win32":
         pass
 
 from PyQt6.QtCore import Qt, QEvent, QStandardPaths, pyqtSignal, QMimeData, QTimer
+from PyQt6.QtGui import QFontDatabase
 from PyQt6.QtGui import (
     QPainter, QPainterPath, QColor, QPen, QFont, QIcon, QPixmap, QAction, QRegion,
     QDrag, QCursor,
@@ -37,6 +38,32 @@ from PyQt6.QtWidgets import (
     QWIDGETSIZE_MAX, QTextEdit, QMessageBox,
     QGraphicsDropShadowEffect,
 )
+
+
+# ──────────────────────────────────────────────
+# 跨平台字体选择
+# ──────────────────────────────────────────────
+
+def _pick_ui_font():
+    """按平台/已安装字体自动选择 UI 字体"""
+    families = QFontDatabase.families()
+    # 中文 UI 字体候选优先级
+    candidates = [
+        "Microsoft YaHei UI", "PingFang SC", "Noto Sans CJK SC",
+        "Noto Sans SC", "Source Han Sans SC", "WenQuanYi Zen Hei",
+    ]
+    for name in candidates:
+        if name in families:
+            return name
+    return ""  # 回退到系统默认
+
+
+UI_FONT_NAME = _pick_ui_font()
+
+
+def UI_FONT(size, weight=QFont.Weight.Normal):
+    """统一创建 UI 字体"""
+    return QFont(UI_FONT_NAME, size, weight)
 
 
 # ──────────────────────────────────────────────
@@ -239,7 +266,7 @@ class TaskDetailPopup(QWidget):
         top_bar = QHBoxLayout()
         top_bar.setContentsMargins(0, 0, 0, 0)
         title = QLabel("任务详情")
-        title.setFont(QFont("Microsoft YaHei UI", 12, QFont.Weight.Bold))
+        title.setFont(UI_FONT(12, QFont.Weight.Bold))
         title.setStyleSheet("color: #333;")
         top_bar.addWidget(title, stretch=1)
 
@@ -264,7 +291,7 @@ class TaskDetailPopup(QWidget):
         self.text_edit = QTextEdit()
         self.text_edit.setReadOnly(True)
         self.text_edit.setPlainText(self.task_text)
-        self.text_edit.setFont(QFont("Microsoft YaHei UI", 12))
+        self.text_edit.setFont(UI_FONT(12))
         self.text_edit.setStyleSheet(
             "QTextEdit {"
             "  background: #fff; border: 1px solid #e0ddd0;"
@@ -369,7 +396,7 @@ class TaskItemWidget(QWidget):
         layout.addWidget(self.cb)
 
         self.label = QLabel(self.task["text"])
-        self.label.setFont(QFont("Microsoft YaHei UI", 12))
+        self.label.setFont(UI_FONT(12))
         self.label.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         self.label.setWordWrap(False)
         self.label.setMinimumWidth(40)
@@ -626,17 +653,17 @@ class StickyNotes(QWidget):
         layout.setSpacing(6)
 
         icon = QLabel("📌")
-        icon.setFont(QFont("Segoe UI Emoji", 14))
+        icon.setFont(QFont("Segoe UI Emoji", 14))  # emoji 字体，emoji 在各平台有系统回退
         layout.addWidget(icon)
 
         title = QLabel("便签")
-        title.setFont(QFont("Microsoft YaHei UI", 13, QFont.Weight.Bold))
+        title.setFont(UI_FONT(13, QFont.Weight.Bold))
         title.setStyleSheet("color: #333;")
         layout.addWidget(title)
 
         # 任务计数
         self.counter_label = QLabel("")
-        self.counter_label.setFont(QFont("Microsoft YaHei UI", 11))
+        self.counter_label.setFont(UI_FONT(11))
         self.counter_label.setStyleSheet("color: #888;")
         layout.addWidget(self.counter_label, stretch=1)
 
@@ -687,7 +714,7 @@ class StickyNotes(QWidget):
 
         self.input_box = QLineEdit()
         self.input_box.setPlaceholderText("添加任务...")
-        self.input_box.setFont(QFont("Microsoft YaHei UI", 12))
+        self.input_box.setFont(UI_FONT(12))
         self.input_box.setFixedHeight(34)
         self.input_box.setStyleSheet(
             "QLineEdit { "
@@ -703,7 +730,7 @@ class StickyNotes(QWidget):
         btn_add.setFixedHeight(34)
         btn_add.setFixedWidth(34)
         btn_add.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_add.setFont(QFont("Microsoft YaHei UI", 18, QFont.Weight.Bold))
+        btn_add.setFont(UI_FONT(18, QFont.Weight.Bold))
         btn_add.setStyleSheet(
             "QPushButton { background: #52c41a; color: #fff; border: none; "
             "border-radius: 8px; }"
@@ -748,7 +775,7 @@ class StickyNotes(QWidget):
             p.setBrush(QColor("#FFFEF0"))
             p.setPen(QPen(QColor("#d9d9d9"), 2))
             p.drawRoundedRect(2, 2, 60, 60, 12, 12)
-            p.setFont(QFont("Segoe UI Emoji", 28))
+            p.setFont(QFont("Segoe UI Emoji", 28))  # emoji 回退
             p.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "📌")
             p.end()
             self.tray_icon.setIcon(QIcon(pixmap))
