@@ -25,9 +25,10 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-from PyQt6.QtCore import Qt, QEvent, QStandardPaths, pyqtSignal
+from PyQt6.QtCore import Qt, QEvent, QStandardPaths, pyqtSignal, QMimeData, QTimer
 from PyQt6.QtGui import (
     QPainter, QPainterPath, QColor, QPen, QFont, QIcon, QPixmap, QAction, QRegion,
+    QDrag, QCursor,
 )
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -343,13 +344,17 @@ class TaskDetailPopup(QWidget):
 
 
 class TaskItemWidget(QWidget):
-    """单条任务项：复选框 + 文本 + 删除按钮"""
+    """单条任务项：复选框 + 文本 + 删除按钮，支持拖拽排序"""
+
+    DRAG_THRESHOLD = 5  # 像素，超过此距离才视为拖拽
 
     def __init__(self, task, on_toggle, on_delete, show_detail=None, parent=None):
         super().__init__(parent)
         self.task = task
         self._full_text = task["text"]
         self._show_detail = show_detail
+        self._drag_start_pos = None
+        self._drag_started = False
         self.setFixedHeight(40)
         self._setup_ui(on_toggle, on_delete)
         self._apply_style()
@@ -405,6 +410,52 @@ class TaskItemWidget(QWidget):
         self.btn_del.setVisible(False)
         super().leaveEvent(event)
 
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start_pos = event.position().toPoint()
+            self._drag_started = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (
+            self._drag_start_pos is not None
+            and not self._drag_started
+            and event.buttons() & Qt.MouseButton.LeftButton
+        ):
+            dist = (event.position().toPoint() - self._drag_start_pos).manhattanLength()
+            if dist >= self.DRAG_THRESHOLD:
+                self._start_drag()
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_start_pos = None
+        self._drag_started = False
+        super().mouseReleaseEvent(event)
+
+    def _start_drag(self):
+        """启动拖拽：携带任务 ID 作为 MIME 数据"""
+        self._drag_started = True
+        mime = QMimeData()
+        mime.setText(str(self.task["id"]))
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.setPixmap(self._make_drag_pixmap())
+        drag.setHotSpot(QCursor.pos() - self.mapToGlobal(self.rect().topLeft()))
+        drag.exec(Qt.DropAction.MoveAction)
+        self._drag_started = False
+        self._drag_start_pos = None
+
+    def _make_drag_pixmap(self) -> QPixmap:
+        """生成拖拽时的半透明截图"""
+        pixmap = QPixmap(self.size())
+        self.render(pixmap)
+        painter = QPainter(pixmap)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+        painter.fillRect(pixmap.rect(), QColor(0, 0, 0, 120))
+        painter.end()
+        return pixmap
+
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self._show_detail:
             # 点击 checkbox 区域不触发详情
@@ -426,6 +477,7 @@ DIVIDER = "#f0ece0"
 FOLD_HEIGHT = 32
 DEFAULT_W, DEFAULT_H = 260, 300
 CORNER_RADIUS = 10
+DEAD_ZONE_RATIO = 0.40  # 死区占单条高度的比例，避免交界处抽搐
 SHADOW_WIDTH = 4  # 阴影外扩宽度
 
 
@@ -442,6 +494,14 @@ class StickyNotes(QWidget):
         self.is_dragging = False
         self._task_widgets = []
         self.empty_label = None
+        self._drag_source_id = None
+        self._drag_indicator = None
+        self._drag_target_idx = -1
+        self._drag_last_viewport_y = None
+        self._scroll_timer = QTimer(self)
+        self._scroll_timer.setInterval(20)
+        self._scroll_timer.timeout.connect(self._on_scroll_tick)
+        self._scroll_dir = 0  # -1=up, 1=down, 0=none
 
         self._init_window()
         self._load_and_restore()
@@ -531,6 +591,8 @@ class StickyNotes(QWidget):
         self.task_layout.setContentsMargins(0, 0, 0, 0)
         self.task_layout.setSpacing(0)
         self.scroll_area.setWidget(self.task_container)
+        self.scroll_area.viewport().setAcceptDrops(True)
+        self.scroll_area.viewport().installEventFilter(self)
         self.content_layout.addWidget(self.scroll_area)
 
         # 分隔线
@@ -855,6 +917,197 @@ class StickyNotes(QWidget):
     def _save_current_state(self):
         self.dm.save_data(self, self.tasks, self.is_collapsed)
 
+    # ── 拖拽排序 ──
+
+    def _get_cursor_in_container_y(self) -> int:
+        """获取当前鼠标在 task_container 坐标系中的 Y 值"""
+        global_pt = QCursor.pos()
+        container_pt = self.task_container.mapFromGlobal(global_pt)
+        return container_pt.y()
+
+    def _ensure_drag_indicator(self):
+        """创建或获取拖拽占位指示线"""
+        if self._drag_indicator is None:
+            indicator = QFrame()
+            indicator.setFixedHeight(3)
+            indicator.setStyleSheet(
+                "QFrame { background: #52c41a; border-radius: 1.5px; }"
+            )
+            indicator.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            self._drag_indicator = indicator
+
+    def _handle_add_drag(self, event):
+        event.acceptProposedAction()
+        if event.mimeData().hasText():
+            tid = int(event.mimeData().text())
+            for t in self.tasks:
+                if t["id"] == tid:
+                    self._drag_source_id = tid
+                    break
+
+    def _get_gap_at_y(self, y):
+        """根据 Y 坐标算出应该插入的间隙索引（0 ~ len(tasks)）。
+           调用前指示线必须不在 layout 中。"""
+        for i, w in enumerate(self._task_widgets):
+            if w is None or not w.isVisible():
+                continue
+            center = w.y() + w.height() // 2
+            if y < center:
+                return i
+        return len(self.tasks)
+
+    def _handle_move_drag(self, event):
+        if self._drag_source_id is None:
+            return
+
+        vp_y = event.position().y()
+        self._drag_last_viewport_y = vp_y
+
+        # 计算边缘滚动：检测区为视口 1/3
+        vp_h = self.scroll_area.viewport().height()
+        detect_zone = vp_h / 3
+        scroll_dir = 0
+        if vp_y < detect_zone:
+            scroll_dir = -1
+        elif vp_y > vp_h - detect_zone:
+            scroll_dir = 1
+
+        if scroll_dir != self._scroll_dir:
+            self._scroll_dir = scroll_dir
+            if scroll_dir != 0 and not self._scroll_timer.isActive():
+                self._scroll_timer.start()
+            elif scroll_dir == 0 and self._scroll_timer.isActive():
+                self._scroll_timer.stop()
+
+        # 更新指示线位置
+        y = self._get_cursor_in_container_y()
+        self._ensure_drag_indicator()
+        layout = self.task_layout
+
+        # 先移除指示线，拿到未偏移的真实 widget 位置
+        layout.removeWidget(self._drag_indicator)
+
+        new_gap = self._get_gap_at_y(y)
+
+        # 死区：同一位置不动
+        if new_gap == self._drag_target_idx:
+            # 重新插回原位置
+            self._show_indicator_at(new_gap)
+            return
+        self._drag_target_idx = new_gap
+
+        self._show_indicator_at(new_gap)
+        self._drag_indicator.show()
+        event.acceptProposedAction()
+
+    def _show_indicator_at(self, gap_idx):
+        """在指定间隙索引处插入指示线"""
+        layout = self.task_layout
+        if gap_idx >= len(self.tasks):
+            layout.addWidget(self._drag_indicator)
+        else:
+            target_w = self._task_widgets[gap_idx]
+            target_idx = layout.indexOf(target_w)
+            layout.insertWidget(target_idx, self._drag_indicator)
+        self._drag_indicator.show()
+
+    def _on_scroll_tick(self):
+        """定时器触发：根据鼠标位置驱动滚动条，然后刷新指示线位置"""
+        if self._drag_last_viewport_y is None:
+            self._scroll_timer.stop()
+            return
+
+        vp_h = self.scroll_area.viewport().height()
+        y_vp = self._drag_last_viewport_y
+
+        detect_zone = vp_h / 3
+        direction = 0
+        if y_vp < detect_zone:
+            direction = -1
+            d = y_vp
+        elif y_vp > vp_h - detect_zone:
+            direction = 1
+            d = vp_h - y_vp
+        else:
+            return
+
+        # 距检测区内缘到 1/4 检测区位置逐渐加速，之后一直保持最快
+        threshold = detect_zone / 4
+        if d <= threshold:
+            ratio = 1.0
+        else:
+            ratio = (detect_zone - d) / (detect_zone - threshold)
+
+        # 加速：1~20px/20ms
+        speed = int(1 + 19 * ratio) * direction
+        bar = self.scroll_area.verticalScrollBar()
+        new_val = bar.value() + speed
+        bar.setValue(new_val)
+
+        # 滚动后重新计算指示线
+        y_container = self._get_cursor_in_container_y()
+        self._ensure_drag_indicator()
+        layout = self.task_layout
+        layout.removeWidget(self._drag_indicator)
+        new_gap = self._get_gap_at_y(y_container)
+        if new_gap != self._drag_target_idx:
+            self._drag_target_idx = new_gap
+        self._show_indicator_at(new_gap)
+
+    def _stop_auto_scroll(self):
+        """停止自动滚动"""
+        self._scroll_timer.stop()
+        self._scroll_dir = 0
+
+    def _handle_leave_drag(self):
+        self._drag_source_id = None
+        self._drag_target_idx = None
+        self._stop_auto_scroll()
+        if self._drag_indicator is not None:
+            self._drag_indicator.hide()
+
+    def _handle_drop(self, event):
+        if self._drag_source_id is None:
+            return
+        if not event.mimeData().hasText():
+            return
+
+        task_id = int(event.mimeData().text())
+
+        # 从列表移除
+        old_idx = None
+        for i, t in enumerate(self.tasks):
+            if t["id"] == task_id:
+                old_idx = i
+                break
+        if old_idx is None:
+            return
+        task = self.tasks.pop(old_idx)
+
+        # 目标索引用死区计算出的值
+        if self._drag_target_idx is None:
+            target_idx = len(self.tasks)
+        else:
+            target_idx = self._drag_target_idx
+            # pop 后目标可能前移
+            if old_idx < target_idx:
+                target_idx -= 1
+            target_idx = max(0, min(target_idx, len(self.tasks)))
+
+        if target_idx >= len(self.tasks):
+            self.tasks.append(task)
+        else:
+            self.tasks.insert(target_idx, task)
+
+        # 清理
+        self._stop_auto_scroll()
+        self._drag_indicator.hide()
+        self._drag_indicator = None
+        self._drag_source_id = None
+        self._drag_target_idx = None
+        self.render_tasks()
+        self._save_current_state()
+
     # ── 渲染任务列表 ──
 
     def _create_empty_label(self):
@@ -922,8 +1175,21 @@ class StickyNotes(QWidget):
                 break
 
     def eventFilter(self, obj, event):
-        if obj == self.scroll_area and event.type() == QEvent.Type.Paint:
-            pass
+        viewport = self.scroll_area.viewport()
+        if obj == viewport:
+            etype = event.type()
+            if etype == QEvent.Type.DragEnter:
+                self._handle_add_drag(event)
+                return True
+            elif etype == QEvent.Type.DragMove:
+                self._handle_move_drag(event)
+                return True
+            elif etype == QEvent.Type.DragLeave:
+                self._handle_leave_drag()
+                return True
+            elif etype == QEvent.Type.Drop:
+                self._handle_drop(event)
+                return True
         return super().eventFilter(obj, event)
 
 
