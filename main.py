@@ -929,9 +929,21 @@ class StickyNotes(QWidget):
         self._save_current_state()
 
     def toggle_task(self, task_id: int):
-        for t in self.tasks:
+        for i, t in enumerate(self.tasks):
             if t["id"] == task_id:
-                t["completed"] = not t["completed"]
+                task = self.tasks.pop(i)
+                task["completed"] = not task["completed"]
+                if task["completed"]:
+                    # 完成的任务移到最后
+                    self.tasks.append(task)
+                else:
+                    # 取消完成的任务放回未完成列表末尾（所有未完成任务之后）
+                    insert_pos = len(self.tasks)
+                    for j, t2 in enumerate(self.tasks):
+                        if t2["completed"]:
+                            insert_pos = j
+                            break
+                    self.tasks.insert(insert_pos, task)
                 break
         self.render_tasks()
         self._save_current_state()
