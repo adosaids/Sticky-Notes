@@ -41,24 +41,24 @@ from PyQt6.QtWidgets import (
 
 
 # ──────────────────────────────────────────────
-# 跨平台字体选择
+# 跨平台字体选择（延迟初始化，需在 QApplication 创建后调用）
 # ──────────────────────────────────────────────
 
-def _pick_ui_font():
-    """按平台/已安装字体自动选择 UI 字体"""
-    families = QFontDatabase.families()
-    # 中文 UI 字体候选优先级
+UI_FONT_NAME = None
+
+
+def _init_ui_font():
+    """初始化全局 UI 字体，必须在 QApplication 创建后调用"""
+    global UI_FONT_NAME
     candidates = [
         "Microsoft YaHei UI", "PingFang SC", "Noto Sans CJK SC",
         "Noto Sans SC", "Source Han Sans SC", "WenQuanYi Zen Hei",
     ]
     for name in candidates:
-        if name in families:
-            return name
-    return ""  # 回退到系统默认
-
-
-UI_FONT_NAME = _pick_ui_font()
+        if name in QFontDatabase.families():
+            UI_FONT_NAME = name
+            return
+    UI_FONT_NAME = ""  # 回退到系统默认
 
 
 def UI_FONT(size, weight=QFont.Weight.Normal):
@@ -1230,6 +1230,7 @@ def main():
     )
 
     app = QApplication(sys.argv)
+    _init_ui_font()
     app.setApplicationName("StickyNotes")
     app.setQuitOnLastWindowClosed(False)
 
