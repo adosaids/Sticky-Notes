@@ -35,8 +35,18 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QScrollArea,
     QCheckBox, QSystemTrayIcon, QMenu, QFrame,
-    QWIDGETSIZE_MAX, QTextEdit, QMessageBox,
+    QWIDGETSIZE_MAX, QTextEdit, QMessageBox, QDialog,
     QGraphicsDropShadowEffect,
+)
+
+# 模块导入（AI 整理 + 层级任务）
+from ai_organizer import AIOrganizer
+from ai_dialogs import AIConfigDialog, AIOrganizePromptDialog, AIPreviewDialog
+from ai_chat import AIChatPanel
+from tree_widgets import HierarchicalTaskItemWidget
+from task_tree import (
+    visible_tasks, build_tree, has_children, get_descendant_ids,
+    assign_levels_from_ai_response, orphan_children_to_roots,
 )
 
 
@@ -103,13 +113,16 @@ class DataManager:
     def load_data(self) -> dict:
         """读取 JSON，损坏时自动备份并重置"""
         default = {
-            "version": "1.0",
+            "version": "2.0",
             "window": {
                 "x": None, "y": None,
                 "width": DEFAULT_W, "height": DEFAULT_H,
                 "collapsed": False,
             },
             "tasks": [],
+            "ai_config": {
+                "endpoint": "", "api_key": "", "model": "",
+            },
         }
         if not self.data_file.exists():
             return default
@@ -118,24 +131,35 @@ class DataManager:
             data = json.loads(raw)
             if not isinstance(data, dict) or "tasks" not in data:
                 raise ValueError("数据结构异常")
-            data.setdefault("version", "1.0")
+            data.setdefault("version", "2.0")
             data.setdefault("window", default["window"])
             data["window"].setdefault("x", None)
             data["window"].setdefault("y", None)
             data["window"].setdefault("width", DEFAULT_W)
             data["window"].setdefault("height", DEFAULT_H)
             data["window"].setdefault("collapsed", False)
+            data.setdefault("ai_config", default["ai_config"])
+            data["ai_config"].setdefault("endpoint", "")
+            data["ai_config"].setdefault("api_key", "")
+            data["ai_config"].setdefault("model", "")
             if not isinstance(data["tasks"], list):
                 data["tasks"] = []
+            # Schema 迁移：v1.0 → v2.0
+            if data["version"] == "1.0":
+                for task in data["tasks"]:
+                    task.setdefault("level", 1)
+                    task.setdefault("parentId", None)
+                    task.setdefault("collapsed", False)
+                data["version"] = "2.0"
             return data
         except Exception:
             self._backup_corrupted()
             return default
 
-    def save_data(self, window, tasks, collapsed):
+    def save_data(self, window, tasks, collapsed, ai_config=None):
         """将窗口状态与任务列表写入 JSON"""
         data = {
-            "version": "1.0",
+            "version": "2.0",
             "window": {
                 "x": window.x(),
                 "y": window.y(),
@@ -145,6 +169,8 @@ class DataManager:
             },
             "tasks": tasks,
         }
+        if ai_config:
+            data["ai_config"] = ai_config
         tmp = self.data_file.with_suffix(".tmp")
         try:
             tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -164,6 +190,28 @@ class DataManager:
             shutil.copy2(self.data_file, bak)
         except Exception:
             pass
+
+    def get_ai_config(self) -> dict:
+        """读取 AI 配置"""
+        data = self.load_data()
+        return data.get("ai_config", {"endpoint": "", "api_key": "", "model": ""})
+
+    def save_ai_config(self, config: dict):
+        """单独保存 AI 配置（不覆盖任务数据）"""
+        data = self.load_data()
+        data["ai_config"] = config
+        data["version"] = "2.0"
+        tmp = self.data_file.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(self.data_file)
+        except Exception:
+            try:
+                self.data_file.write_text(
+                    json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+            except Exception:
+                pass
 
 
 # ──────────────────────────────────────────────
@@ -232,16 +280,17 @@ class TaskDetailPopup(QWidget):
 
     delete_requested = pyqtSignal(int)
 
-    def __init__(self, task_text: str, task_id: int, on_delete, parent=None):
+    def __init__(self, task_text: str, task_id: int, on_delete, on_text_changed=None, parent=None):
         super().__init__(parent)
         self.task_text = task_text
         self.task_id = task_id
         self.on_delete = on_delete
+        self.on_text_changed = on_text_changed
         self._setup_ui()
 
     def _setup_ui(self):
         self.setWindowFlags(
-            Qt.WindowType.Popup
+            Qt.WindowType.Tool
             | Qt.WindowType.FramelessWindowHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -287,9 +336,8 @@ class TaskDetailPopup(QWidget):
         top_bar.addWidget(btn_close)
         inner.addLayout(top_bar)
 
-        # 内容区：只读 QTextEdit（自动换行）
+        # 内容区：可编辑 QTextEdit（自动换行）
         self.text_edit = QTextEdit()
-        self.text_edit.setReadOnly(True)
         self.text_edit.setPlainText(self.task_text)
         self.text_edit.setFont(UI_FONT(12))
         self.text_edit.setStyleSheet(
@@ -300,7 +348,10 @@ class TaskDetailPopup(QWidget):
         )
         self.text_edit.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.text_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.text_edit.setMinimumHeight(100)
+        self.text_edit.setMinimumHeight(120)
+        self.text_edit.selectAll()
+        self.text_edit.setFocus()
+        self.text_edit.textChanged.connect(self._on_text_changed)
         inner.addWidget(self.text_edit)
 
         # 底部：删除按钮
@@ -347,6 +398,17 @@ class TaskDetailPopup(QWidget):
             self.delete_requested.emit(self.task_id)
             self.close()
 
+    def _on_text_changed(self):
+        """实时保存编辑内容"""
+        new_text = self.text_edit.toPlainText().strip()
+        if new_text and self.on_text_changed:
+            self.on_text_changed(self.task_id, new_text)
+
+    def focusOutEvent(self, event):
+        """点击窗口外部时关闭"""
+        self.close()
+        super().focusOutEvent(event)
+
     def show_at(self, parent_widget):
         """定位到父组件右侧弹出，超出屏幕则换到左侧"""
         geo = parent_widget.geometry()
@@ -356,7 +418,7 @@ class TaskDetailPopup(QWidget):
         # 用 QTextEdit.document().size() 估算内容高度
         doc_h = self.text_edit.document().size().height()
         # 加上顶部标题栏、边距、底部按钮的大致高度
-        estimated_h = max(200, min(450, int(doc_h + 90)))
+        estimated_h = max(250, min(500, int(doc_h + 110)))
         self.setFixedHeight(estimated_h)
 
         popup_h = self.height()
@@ -530,8 +592,12 @@ class StickyNotes(QWidget):
         self._scroll_timer.timeout.connect(self._on_scroll_tick)
         self._scroll_dir = 0  # -1=up, 1=down, 0=none
 
+        # AI 整理器
+        self.ai_organizer = None
+
         self._init_window()
         self._load_and_restore()
+        self._init_ai_organizer()
         self._setup_ui()
         self._setup_tray()
         self._restore_geometry()
@@ -580,6 +646,65 @@ class StickyNotes(QWidget):
 
         if self.is_collapsed:
             self._do_collapse()
+
+    # ── AI 整理 ──
+
+    def _init_ai_organizer(self):
+        """初始化 AI 整理器（如果配置已存在）"""
+        config = self.dm.get_ai_config()
+        if config.get("endpoint") and config.get("api_key"):
+            self.ai_organizer = AIOrganizer(config)
+
+    def _on_ai_organize(self, task_id: int):
+        """右键菜单触发：AI 整理任务 → 打开聊天面板"""
+        config = self.dm.get_ai_config()
+        if not config.get("endpoint") or not config.get("api_key"):
+            dialog = AIConfigDialog(config, parent=self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            config = dialog.get_config()
+            self.dm.save_ai_config(config)
+        self.ai_organizer = AIOrganizer(config)
+
+        # 构建初始提示文本（预填到输入框，用户可编辑后发送）
+        task_lines = []
+        for t in self.tasks:
+            status = "[x]" if t.get("completed") else "[ ]"
+            indent = "  " * (t.get("level", 1) - 1)
+            task_lines.append(f"{indent}{status} {t['text']}")
+        task_text = "\n".join(task_lines) if task_lines else "（暂无任务）"
+
+        user_goal = f"当前任务列表：\n{task_text}\n\n请帮我整理这些任务。"
+
+        # 打开聊天面板
+        self._chat_panel = AIChatPanel(self.tasks, self.ai_organizer, user_goal, self)
+        self._chat_panel.tasks_accepted.connect(self._on_chat_tasks_accepted)
+
+    def _on_chat_tasks_accepted(self, new_tasks: list):
+        """聊天面板请求写入任务：补全字段后追加到列表并重新渲染。"""
+        from task_tree import assign_levels_from_ai_response
+        completed_tasks = assign_levels_from_ai_response(new_tasks)
+        self.tasks.extend(completed_tasks)
+        self.render_tasks()
+        self._save_current_state()
+
+    def _show_ai_config(self):
+        """从托盘菜单打开 AI 设置"""
+        config = self.dm.get_ai_config()
+        dialog = AIConfigDialog(config, parent=self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            new_config = dialog.get_config()
+            self.dm.save_ai_config(new_config)
+            self.ai_organizer = AIOrganizer(new_config)
+
+    def _on_expand_toggle(self, task_id: int):
+        """切换任务的展开/收起状态"""
+        for t in self.tasks:
+            if t["id"] == task_id:
+                t["collapsed"] = not t.get("collapsed", False)
+                break
+        self.render_tasks()
+        self._save_current_state()
 
     # ── UI 构建 ──
 
@@ -796,6 +921,12 @@ class StickyNotes(QWidget):
 
         tray_menu.addSeparator()
 
+        action_ai = QAction("AI 设置", self)
+        action_ai.triggered.connect(self._show_ai_config)
+        tray_menu.addAction(action_ai)
+
+        tray_menu.addSeparator()
+
         action_quit = QAction("退出应用", self)
         action_quit.triggered.connect(self._quit_app)
         tray_menu.addAction(action_quit)
@@ -929,32 +1060,52 @@ class StickyNotes(QWidget):
         self._save_current_state()
 
     def toggle_task(self, task_id: int):
-        for i, t in enumerate(self.tasks):
+        # 获取任务及其所有后代
+        descendant_ids = set(get_descendant_ids(task_id, self.tasks))
+        subtree_ids = {task_id} | descendant_ids
+
+        # 提取子树（保持原顺序）
+        subtree = []
+        for t in self.tasks:
+            if t["id"] in subtree_ids:
+                subtree.append(t)
+
+        # 从列表中移除
+        self.tasks = [t for t in self.tasks if t["id"] not in subtree_ids]
+
+        # 切换父任务的完成状态
+        for t in subtree:
             if t["id"] == task_id:
-                task = self.tasks.pop(i)
-                task["completed"] = not task["completed"]
-                if task["completed"]:
-                    # 完成的任务移到最后
-                    self.tasks.append(task)
-                else:
-                    # 取消完成的任务放回未完成列表末尾（所有未完成任务之后）
-                    insert_pos = len(self.tasks)
-                    for j, t2 in enumerate(self.tasks):
-                        if t2["completed"]:
-                            insert_pos = j
-                            break
-                    self.tasks.insert(insert_pos, task)
+                t["completed"] = not t["completed"]
                 break
+
+        if subtree[0]["completed"]:
+            # 完成的任务移到最后
+            self.tasks.extend(subtree)
+        else:
+            # 取消完成的任务放回未完成列表末尾
+            insert_pos = len(self.tasks)
+            for j, t2 in enumerate(self.tasks):
+                if t2["completed"]:
+                    insert_pos = j
+                    break
+            for i, t in enumerate(subtree):
+                self.tasks.insert(insert_pos + i, t)
+
         self.render_tasks()
         self._save_current_state()
 
     def delete_task(self, task_id: int):
+        # 将子任务提升为顶级任务
+        self.tasks = orphan_children_to_roots(task_id, self.tasks)
+        # 移除被删除的任务本身
         self.tasks = [t for t in self.tasks if t["id"] != task_id]
         self.render_tasks()
         self._save_current_state()
 
     def _save_current_state(self):
-        self.dm.save_data(self, self.tasks, self.is_collapsed)
+        ai_config = self.dm.get_ai_config()
+        self.dm.save_data(self, self.tasks, self.is_collapsed, ai_config)
 
     # ── 拖拽排序 ──
 
@@ -1158,7 +1309,7 @@ class StickyNotes(QWidget):
         return label
 
     def render_tasks(self):
-        """重建任务列表 UI"""
+        """重建任务列表 UI（使用可见任务过滤）"""
         # 清除旧组件（跳过 stretch 占位符）
         while self.task_layout.count():
             item = self.task_layout.takeAt(0)
@@ -1167,13 +1318,15 @@ class StickyNotes(QWidget):
 
         self._task_widgets.clear()
 
-        if not self.tasks:
+        visible = visible_tasks(self.tasks)
+
+        if not visible:
             # 每次重新创建 empty_label，防止被之前的 deleteLater 销毁
             self.empty_label = self._create_empty_label()
             self.task_layout.addWidget(self.empty_label)
             self.task_layout.addStretch()
         else:
-            for task in self.tasks:
+            for task in visible:
                 widget = self.build_task_widget(task)
                 self.task_layout.addWidget(widget)
                 self._task_widgets.append(widget)
@@ -1183,16 +1336,21 @@ class StickyNotes(QWidget):
         done = sum(1 for t in self.tasks if t["completed"])
         self.counter_label.setText(f"共 {total} 项 · 已完成 {done} 项")
 
-    def build_task_widget(self, task: dict) -> TaskItemWidget:
-        w = TaskItemWidget(
+    def build_task_widget(self, task: dict) -> HierarchicalTaskItemWidget:
+        w = HierarchicalTaskItemWidget(
             task,
             on_toggle=self.toggle_task,
             on_delete=self.delete_task,
+            on_expand_toggle=self._on_expand_toggle,
             show_detail=self._show_task_detail,
+            on_ai_organize=self._on_ai_organize,
             parent=self,
         )
+        # 传入完整任务列表用于检测子任务
+        w._all_tasks = self.tasks
+        w._update_expand_icon()
         w.setStyleSheet(
-            f"TaskItemWidget {{ border-bottom: 1px solid {DIVIDER}; }}"
+            f"HierarchicalTaskItemWidget {{ border-bottom: 1px solid {DIVIDER}; }}"
         )
         return w
 
@@ -1204,7 +1362,7 @@ class StickyNotes(QWidget):
         # 关闭已存在的弹窗
         if hasattr(self, "_detail_popup") and self._detail_popup.isVisible():
             self._detail_popup.close()
-        popup = TaskDetailPopup(task["text"], task_id, self.delete_task, self)
+        popup = TaskDetailPopup(task["text"], task_id, self.delete_task, self.update_task_text, self)
         popup.delete_requested.connect(self.delete_task)
         self._detail_popup = popup
         # 找到对应的 TaskItemWidget
@@ -1212,6 +1370,19 @@ class StickyNotes(QWidget):
             if w.task["id"] == task_id:
                 popup.show_at(w)
                 break
+
+    def update_task_text(self, task_id: int, new_text: str):
+        """更新任务文本并同步到列表显示"""
+        for t in self.tasks:
+            if t["id"] == task_id:
+                t["text"] = new_text
+                break
+        for w in self._task_widgets:
+            if w.task["id"] == task_id:
+                w.label.setText(new_text)
+                w._full_text = new_text
+                break
+        self._save_current_state()
 
     def eventFilter(self, obj, event):
         viewport = self.scroll_area.viewport()
